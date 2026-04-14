@@ -1,0 +1,39 @@
+{
+  "name": "smart-helmet-platform",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@amap/amap-jsapi-loader": "^1.0.1",
+    "@antv/l7": "^2.25.4",
+    "@antv/l7-maps": "^2.25.4",
+    "axios": "^1.13.2",
+    "echarts": "^6.0.0",
+    "echarts-for-react": "^3.0.5",
+    "ezuikit-js": "^9.0.2",
+    "flv.js": "^1.6.2",
+    "hls.js": "^1.6.15",
+    "leaflet": "^1.9.4",
+    "lucide-react": "^0.556.0",
+    "react": "^19.2.1",
+    "react-dom": "^19.2.1",
+    "react-icons": "^5.6.0",
+    "react-leaflet": "^5.0.0",
+    "react-router-dom": "^7.14.0",
+    "recharts": "^3.5.1",
+    "xlsx": "^0.18.5",
+    "zustand": "^5.0.12"
+  },
+  "devDependencies": {
+    "@types/node": "^22.14.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "less": "^4.6.4",
+    "typescript": "~5.8.2",
+    "vite": "^6.2.0"
+  }
+}
