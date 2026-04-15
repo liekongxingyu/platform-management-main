@@ -462,9 +462,16 @@ const commonOptions = {
     if (points && points.length > 0) {
       const path = points.map(toAmapLngLat);
 
-      // 🟦 矩形：有2个点时自动补成完整矩形
-      if (activeTool === 'rectangle' && path.length === 2) {
-        const [p1, p2] = path;
+      // 🟦 矩形：有2个点或4个点时自动渲染矩形
+      if (activeTool === 'rectangle' && path.length >= 2) {
+        let p1, p2;
+        if (path.length === 2) {
+          // 绘制过程中，只有两个对角点
+          [p1, p2] = path;
+        } else {
+          // 绘制完成后，有四个角点，取第一个和第三个作为对角点
+          [p1, , p2] = path;
+        }
         const rectanglePath = [
           p1,
           [p1[0], p2[1]],
