@@ -11,10 +11,119 @@
     "fence": [
         {
             "_id": {
-                "$oid": "69dcb3e5243c9ff866bb2c9d"
+                "$oid": "69df549fe3fa803b8a13d2cb"
             },
-            "id": "1001",
-            "围栏名称": "一号围栏"
+            "fence_id": "1",
+            "name": "基坑禁入区",
+            "company": "中铁一局",
+            "project": "西安地铁8号线",
+            "shape": "circle",
+            "behavior": "No Entry",
+            "severity": "severe",
+            "geometry": {
+                "center": [
+                    34.28,
+                    109.13
+                ],
+                "radius": 50
+            },
+            "schedule": {
+                "start": "2024-01-01T00:00:00",
+                "end": "2024-12-31T23:59:59"
+            },
+            "effective_time": "00:00-23:59",
+            "worker_count": 0,
+            "remark": "基坑施工区域，禁止无关人员进入",
+            "alarm_type": "high",
+            "is_active": true,
+            "createdAt": "2024-01-01T00:00:00Z",
+            "updatedAt": "2024-01-01T00:00:00Z"
+        },
+        {
+            "_id": {
+                "$oid": "69df54c2e3fa803b8a13d2cd"
+            },
+            "fence_id": "2",
+            "name": "办公区禁出区",
+            "company": "中铁一局",
+            "project": "西安地铁8号线",
+            "shape": "polygon",
+            "behavior": "No Exit",
+            "severity": "normal",
+            "geometry": {
+                "points": [
+                    [
+                        34.282,
+                        109.132
+                    ],
+                    [
+                        34.283,
+                        109.135
+                    ],
+                    [
+                        34.281,
+                        109.136
+                    ],
+                    [
+                        34.28,
+                        109.133
+                    ]
+                ]
+            },
+            "schedule": {
+                "start": "2024-01-01T00:00:00",
+                "end": "2024-12-31T23:59:59"
+            },
+            "effective_time": "00:00-23:59",
+            "worker_count": 0,
+            "remark": "办公区域，工作时间禁止外出",
+            "alarm_type": "medium",
+            "is_active": true,
+            "createdAt": "2024-01-01T00:00:00Z",
+            "updatedAt": "2024-01-01T00:00:00Z"
+        },
+        {
+            "_id": {
+                "$oid": "69df5564e3fa803b8a13d2cf"
+            },
+            "fence_id": "3",
+            "name": "隧道施工区",
+            "company": "中铁隧道局",
+            "project": "西安地铁10号线",
+            "shape": "polygon",
+            "behavior": "No Entry",
+            "severity": "risk",
+            "geometry": {
+                "points": [
+                    [
+                        34.29,
+                        109.14
+                    ],
+                    [
+                        34.295,
+                        109.145
+                    ],
+                    [
+                        34.292,
+                        109.148
+                    ],
+                    [
+                        34.287,
+                        109.143
+                    ]
+                ]
+            },
+            "schedule": {
+                "start": "2024-01-01T00:00:00",
+                "end": "2024-12-31T23:59:59"
+            },
+            "effective_time": "00:00-23:59",
+            "worker_count": 0,
+            "remark": "隧道施工区域，禁止无关人员进入",
+            "alarm_type": "medium",
+            "is_active": true,
+            "createdAt": "2024-01-01T00:00:00Z",
+            "updatedAt": "2024-01-01T00:00:00Z"
         }
     ],
     "team": [

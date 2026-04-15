@@ -1,15 +1,20 @@
 """
-围栏模块控制器 —— 纯内存版（不依赖数据库）
+围栏模块控制器 —— MongoDB版
 提供围栏、定位设备、项目区域的完整 CRUD 接口。
 真实 JT808 定位器的坐标会在 GET /fence/devices 中自动合并。
 """
 import copy
+import json
 import uuid
 from datetime import datetime
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional
 from app.services.jt808_service import jt808_manager
+from app.services.Fence.fence_service import FenceService
+
+# 初始化服务
+fence_service = FenceService()
 
 router = APIRouter(prefix="/fence", tags=["Electronic Fence"])
 
@@ -38,8 +43,8 @@ class FenceItem(BaseModel):
 
 class FenceCreate(BaseModel):
     name: str
-    company: str
-    project: str
+    company: Optional[str] = ""
+    project: Optional[str] = ""
     shape: str  # "circle" | "polygon"  (前端传来的字段名)
     behavior: str
     severity: str
@@ -190,16 +195,61 @@ WORK_TEAMS: List[dict] = [
 @router.get("/list", response_model=List[FenceItem])
 def get_fences():
     """获取所有围栏"""
-    return FENCES
+    # 通过服务层获取围栏数据
+    fences = fence_service.get_fences()
+    # 转换数据格式为前端需要的格式
+    result = []
+    for fence in fences:
+        fence_item = {
+            "id": fence.get("fence_id"),
+            "name": fence.get("name"),
+            "company": fence.get("company"),
+            "project": fence.get("project"),
+            "type": fence.get("shape").capitalize(),  # 转换为大写首字母
+            "behavior": fence.get("behavior"),
+            "severity": fence.get("severity"),
+            "schedule": fence.get("schedule"),
+            "center": fence.get("geometry", {}).get("center"),
+            "radius": fence.get("geometry", {}).get("radius"),
+            "points": fence.get("geometry", {}).get("points"),
+            "createdAt": fence.get("createdAt"),
+            "updatedAt": fence.get("updatedAt")
+        }
+        result.append(fence_item)
+    return result
 
 
 @router.get("/teams", response_model=List[WorkTeamItem])
 def get_work_teams():
     """获取作业队及其围栏"""
+    # 通过服务层获取围栏数据
+    mongo_fences = fence_service.get_fences()
+    
+    # 转换围栏数据格式
+    fences_dict = {}
+    for fence in mongo_fences:
+        fence_id = fence.get("fence_id")
+        fences_dict[fence_id] = {
+            "id": fence_id,
+            "name": fence.get("name"),
+            "company": fence.get("company"),
+            "project": fence.get("project"),
+            "type": fence.get("shape").capitalize(),
+            "behavior": fence.get("behavior"),
+            "severity": fence.get("severity"),
+            "schedule": fence.get("schedule"),
+            "center": fence.get("geometry", {}).get("center"),
+            "radius": fence.get("geometry", {}).get("radius"),
+            "points": fence.get("geometry", {}).get("points"),
+            "createdAt": fence.get("createdAt"),
+            "updatedAt": fence.get("updatedAt")
+        }
+    
+    # 保持原有的作业队数据结构
     result = []
     for team in WORK_TEAMS:
         # 组装作业队下的围栏数据
-        team_fences = [f for f in FENCES if f["id"] in team["fence_ids"]]
+        team_fences = [fences_dict.get(fence_id) for fence_id in team["fence_ids"] if fence_id in fences_dict]
         result.append({
             "id": team["id"],
             "name": team["name"],
@@ -212,43 +262,149 @@ def get_work_teams():
 @router.post("/add", response_model=FenceItem)
 def add_fence(payload: FenceCreate):
     """新建围栏"""
-    now = datetime.now().isoformat()
-
-    # 处理 schedule：优先用 schedule 字段，否则兼容 startTime/endTime
-    if payload.schedule:
-        schedule = payload.schedule.model_dump()
+    # 构建坐标JSON
+    if payload.shape == "circle" and payload.center:
+        coordinates_json = json.dumps(payload.center)
+    elif payload.shape == "polygon" and payload.points:
+        coordinates_json = json.dumps(payload.points)
     else:
-        schedule = {
-            "start": payload.startTime or now,
-            "end": payload.endTime or now,
-        }
+        # 确保coordinates_json至少是一个空数组的JSON格式，避免Pydantic验证错误
+        coordinates_json = "[]"
 
-    new_fence = {
-        "id": str(uuid.uuid4())[:8],
-        "name": payload.name,
-        "company": payload.company,
-        "project": payload.project,
-        "type": "Circle" if payload.shape == "circle" else "Polygon",
-        "behavior": payload.behavior,
-        "severity": payload.severity,
-        "schedule": schedule,
-        "center": payload.center if payload.shape == "circle" else None,
-        "radius": payload.radius if payload.shape == "circle" else None,
-        "points": payload.points if payload.shape == "polygon" else None,
-        "createdAt": now,
-        "updatedAt": now,
+    # 构建FenceCreate对象
+    from app.schemas.fence_schema import FenceCreate as ServiceFenceCreate
+    from app.schemas.fence_schema import AlarmLevel
+
+    # 转换严重程度为AlarmLevel
+    severity_map = {
+        "normal": AlarmLevel.LOW,
+        "risk": AlarmLevel.MEDIUM,
+        "severe": AlarmLevel.HIGH
     }
-    FENCES.append(new_fence)
-    return new_fence
+    alarm_type = severity_map.get(payload.severity, AlarmLevel.MEDIUM)
+
+    # 构建服务层需要的FenceCreate对象
+    # 确保shape值是'polygon'或'circle'，因为ServiceFenceCreate的shape字段是枚举类型
+    service_shape = payload.shape
+    if service_shape != "circle":
+        service_shape = "polygon"
+
+    service_payload = ServiceFenceCreate(
+        name=payload.name,
+        project_region_id=None,
+        shape=service_shape,
+        behavior=payload.behavior,
+        coordinates_json=coordinates_json,
+        radius=payload.radius,
+        effective_time="00:00-23:59",
+        remark="",
+        alarm_type=alarm_type
+    )
+
+    # 通过服务层添加围栏
+    new_fence = fence_service.create_fence(service_payload, company=payload.company, project=payload.project)
+
+    # 转换为前端需要的格式
+    result = {
+        "id": new_fence.get("fence_id"),
+        "name": new_fence.get("name"),
+        "company": new_fence.get("company", ""),
+        "project": new_fence.get("project", ""),
+        "type": new_fence.get("shape").capitalize(),
+        "behavior": new_fence.get("behavior"),
+        "severity": new_fence.get("severity"),
+        "schedule": new_fence.get("schedule"),
+        "center": new_fence.get("geometry", {}).get("center"),
+        "radius": new_fence.get("geometry", {}).get("radius"),
+        "points": new_fence.get("geometry", {}).get("points"),
+        "createdAt": new_fence.get("createdAt"),
+        "updatedAt": new_fence.get("updatedAt")
+    }
+    return result
+
+# 新增：处理前端新的API格式
+class FenceCreateNew(BaseModel):
+    name: str
+    project_region_id: Optional[int] = None
+    shape: str  # "polygon" | "circle"
+    behavior: str  # "No Entry" | "No Exit"
+    coordinates_json: str
+    radius: Optional[float] = None
+    effective_time: str
+    remark: Optional[str] = None
+    alarm_type: str  # "high" | "medium" | "low"
+    deviceIds: Optional[List[str]] = None
+
+@router.post("/", response_model=FenceItem)
+def create_fence_new(payload: FenceCreateNew):
+    """新建围栏（新API格式）"""
+    # 解析坐标JSON
+    coordinates_json = payload.coordinates_json
+    try:
+        coordinates = json.loads(coordinates_json)
+    except:
+        # 如果不是有效的JSON，使用空数组
+        coordinates = []
+        coordinates_json = "[]"
+
+    # 构建FenceCreate对象
+    from app.schemas.fence_schema import FenceCreate as ServiceFenceCreate
+    from app.schemas.fence_schema import AlarmLevel
+
+    # 转换alarm_type为AlarmLevel
+    alarm_type_map = {
+        "low": AlarmLevel.LOW,
+        "medium": AlarmLevel.MEDIUM,
+        "high": AlarmLevel.HIGH
+    }
+    alarm_type = alarm_type_map.get(payload.alarm_type, AlarmLevel.MEDIUM)
+
+    # 构建服务层需要的FenceCreate对象
+    # 确保shape值是'polygon'或'circle'，因为ServiceFenceCreate的shape字段是枚举类型
+    service_shape = payload.shape
+    if service_shape != "circle":
+        service_shape = "polygon"
+
+    service_payload = ServiceFenceCreate(
+        name=payload.name,
+        project_region_id=payload.project_region_id,
+        shape=service_shape,
+        behavior=payload.behavior,
+        coordinates_json=coordinates_json,
+        radius=payload.radius,
+        effective_time=payload.effective_time,
+        remark=payload.remark or "",
+        alarm_type=alarm_type
+    )
+
+    # 通过服务层添加围栏
+    new_fence = fence_service.create_fence(service_payload, company="", project="")
+
+    # 转换为前端需要的格式
+    result = {
+        "id": new_fence.get("fence_id"),
+        "name": new_fence.get("name"),
+        "company": new_fence.get("company", ""),
+        "project": new_fence.get("project", ""),
+        "type": new_fence.get("shape").capitalize(),
+        "behavior": new_fence.get("behavior"),
+        "severity": new_fence.get("severity"),
+        "schedule": new_fence.get("schedule"),
+        "center": new_fence.get("geometry", {}).get("center"),
+        "radius": new_fence.get("geometry", {}).get("radius"),
+        "points": new_fence.get("geometry", {}).get("points"),
+        "createdAt": new_fence.get("createdAt"),
+        "updatedAt": new_fence.get("updatedAt")
+    }
+    return result
 
 
 @router.delete("/delete/{fence_id}")
 def delete_fence(fence_id: str):
     """删除围栏"""
-    global FENCES
-    before = len(FENCES)
-    FENCES = [f for f in FENCES if f["id"] != fence_id]
-    if len(FENCES) == before:
+    # 通过服务层删除围栏
+    success = fence_service.delete_fence(fence_id)
+    if not success:
         raise HTTPException(status_code=404, detail="Fence not found")
     return {"status": "success"}
 
@@ -395,32 +551,53 @@ def generate_fence_from_points(payload: FenceCreate):
     raw_points = [[p["lat"], p["lng"]] for p in COLLECTING_POINTS]
     sorted_points = convex_hull(raw_points)
     
-    now = datetime.now().isoformat()
-    if payload.schedule:
-        schedule = payload.schedule.model_dump()
-    else:
-        schedule = {
-            "start": payload.startTime or now,
-            "end": payload.endTime or now,
-        }
-    
-    new_fence = {
-        "id": str(uuid.uuid4())[:8],
-        "name": payload.name,
-        "company": payload.company,
-        "project": payload.project,
+    # 构建坐标JSON
+    coordinates_json = json.dumps(sorted_points)
+
+    # 构建FenceCreate对象
+    from app.schemas.fence_schema import FenceCreate as ServiceFenceCreate
+    from app.schemas.fence_schema import AlarmLevel
+
+    # 转换严重程度为AlarmLevel
+    severity_map = {
+        "normal": AlarmLevel.LOW,
+        "risk": AlarmLevel.MEDIUM,
+        "severe": AlarmLevel.HIGH
+    }
+    alarm_type = severity_map.get(payload.severity, AlarmLevel.MEDIUM)
+
+    # 构建服务层需要的FenceCreate对象
+    service_payload = ServiceFenceCreate(
+        name=payload.name,
+        project_region_id=None,
+        shape="polygon",
+        behavior=payload.behavior,
+        coordinates_json=coordinates_json,
+        radius=None,
+        effective_time="00:00-23:59",
+        remark="",
+        alarm_type=alarm_type
+    )
+
+    # 通过服务层添加围栏
+    new_fence = fence_service.create_fence(service_payload, company=payload.company, project=payload.project)
+    COLLECTING_POINTS.clear()
+
+    # 转换为前端需要的格式
+    result = {
+        "id": new_fence.get("fence_id"),
+        "name": new_fence.get("name"),
+        "company": new_fence.get("company", ""),
+        "project": new_fence.get("project", ""),
         "type": "Polygon",
-        "behavior": payload.behavior,
-        "severity": payload.severity,
-        "schedule": schedule,
+        "behavior": new_fence.get("behavior"),
+        "severity": new_fence.get("severity"),
+        "schedule": new_fence.get("schedule"),
         "center": None,
         "radius": None,
-        "points": sorted_points,
-        "createdAt": now,
-        "updatedAt": now,
+        "points": new_fence.get("geometry", {}).get("points"),
+        "createdAt": new_fence.get("createdAt"),
+        "updatedAt": new_fence.get("updatedAt")
     }
     
-    FENCES.append(new_fence)
-    COLLECTING_POINTS.clear()
-    
-    return new_fence
+    return result

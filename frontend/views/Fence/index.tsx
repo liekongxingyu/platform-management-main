@@ -194,6 +194,7 @@ const handleClearDraw = () => {
 };
 
 const handleSaveFenceWithRules = (ruleData: any) => {
+  const shape = ruleData.shape === 'circle' ? 'circle' : 'polygon';
   const newFence = {
     id: Date.now().toString(),
     name: ruleData.name,
@@ -203,8 +204,8 @@ const handleSaveFenceWithRules = (ruleData: any) => {
     description: ruleData.description,
     behavior: ruleData.behavior,
     severity: ruleData.severity,
-    type: ruleData.shape === 'circle' ? 'Circle' : 'Polygon',
-    shape: ruleData.shape,
+    type: shape === 'circle' ? 'Circle' : 'Polygon',
+    shape: shape,
     center: ruleData.center,
     points: ruleData.points,
     radius: ruleData.radius || 100,
@@ -246,7 +247,7 @@ const handleSaveFenceAfterDraw = () => {
       description: pendingFenceData.description,
       behavior: pendingFenceData.behavior,
       severity: pendingFenceData.severity,
-      shape: pendingFenceData.shape,
+      shape: "circle",
       center: tempCenter,
       points: pendingFenceData.points,
       radius: pendingFenceData.radius,
@@ -272,7 +273,7 @@ const handleSaveFenceAfterDraw = () => {
       description: pendingFenceData.description,
       behavior: pendingFenceData.behavior,
       severity: pendingFenceData.severity,
-      shape: pendingFenceData.shape,
+      shape: "polygon",
       center: pendingFenceData.center,
       points: tempPoints,
       radius: pendingFenceData.radius,
@@ -733,6 +734,8 @@ const handleCancelDraw = () => {
 };
 
 const handleFenceFormSubmit = (data: any) => {
+  const shape = data.shape === "circle" ? "circle" : "polygon";
+  
   if (editingFenceId) {
     updateFence(editingFenceId, {
       name: data.name,
@@ -741,7 +744,8 @@ const handleFenceFormSubmit = (data: any) => {
       description: data.description,
       behavior: data.behavior,
       severity: data.severity,
-      type: data.shape === "circle" ? "Circle" : "Polygon",
+      type: shape === "circle" ? "Circle" : "Polygon",
+      shape: shape,
       center: data.center,
       points: data.points,
       radius: data.radius,
@@ -753,7 +757,7 @@ const handleFenceFormSubmit = (data: any) => {
     setEditingFenceId(null);
     alert("围栏更新成功！");
   } else {
-    setPendingFenceData(data);
+    setPendingFenceData({ ...data, shape: shape });
   }
   
   setShowAddModal(false);
