@@ -638,6 +638,7 @@ class AIManager:
                 description=alarm_msg,
                 status="pending",
                 timestamp=datetime.now(),
+                alarm_image_path=image_path,
                 recording_status="pending",
             )
 
