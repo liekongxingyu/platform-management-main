@@ -2047,7 +2047,7 @@ class VideoService:
 
     def _get_alarm_video_root(self) -> str:
         base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        alarm_root = os.path.join(base_dir, "static", "alarms")
+        alarm_root = os.path.join(base_dir, "static", "alarm_videos")
         os.makedirs(alarm_root, exist_ok=True)
         return alarm_root
 
