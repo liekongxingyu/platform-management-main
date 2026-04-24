@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { createPortal } from 'react-dom';
+import { alarmApi, toStaticUrl, type AlarmResponse } from '../src/api/alarmApi';
 import { 
   Bell, 
   ShieldAlert, 
@@ -28,6 +29,7 @@ interface AlarmRecord {
   deviceName: string;
   deviceId: string;
   snapshot?: string;
+  videoPath?: string;
   fenceId?: string;
   fenceName?: string;
 }
@@ -151,34 +153,77 @@ const [selectedCompany, setSelectedCompany] = useState<string>('all');
 const [selectedProject, setSelectedProject] = useState<string>('all');
 const [filterTreePos, setFilterTreePos] = useState<{ top: number; left: number } | null>(null);
 const filterTreeRef = useRef<HTMLDivElement>(null);
+const mapAlarmFromApi = (item: AlarmResponse): AlarmRecord => {
+  const isFence = item.fence_id !== undefined && item.fence_id !== null;
 
-// 在 AlarmRecords 组件中添加
-useEffect(() => {
-  // 从 localStorage 加载历史告警
-  const storedAlarms = localStorage.getItem('alarm_records');
-  if (storedAlarms) {
-    const parsed = JSON.parse(storedAlarms);
-    const allAlarms = [...parsed, ...mockFenceAlarms, ...mockVideoAlarms].sort(
-      (a, b) => new Date(b.time).getTime() - new Date(a.time).getTime()
-    );
-    setAlarms(allAlarms);
-  } else {
-    const allAlarms = [...mockFenceAlarms, ...mockVideoAlarms].sort(
-      (a, b) => new Date(b.time).getTime() - new Date(a.time).getTime()
-    );
-    setAlarms(allAlarms);
+  const rawType = String(item.alarm_type || '');
+  const title = rawType || (isFence ? '围栏告警' : '视频告警');
+
+  const locationText =
+    item.location && String(item.location).trim()
+      ? String(item.location)
+      : '未提供位置';
+
+  return {
+    id: String(item.id),
+    type: isFence ? 'fence' : 'video',
+    title,
+    description: item.description || '',
+    time: item.timestamp,
+    level:
+      item.severity === 'HIGH'
+        ? 'high'
+        : item.severity === 'MEDIUM'
+          ? 'medium'
+          : 'low',
+    status:
+      item.status === 'pending' || item.status === 'resolved' || item.status === 'ignored'
+        ? item.status
+        : 'pending',
+    location: locationText,
+    deviceName: `设备-${item.device_id}`,
+    deviceId: String(item.device_id),
+    snapshot: toStaticUrl(item.alarm_image_path),
+    videoPath: toStaticUrl(item.recording_path),
+    fenceId:
+      item.fence_id !== undefined && item.fence_id !== null
+        ? String(item.fence_id)
+        : undefined,
+    fenceName: isFence ? locationText : undefined,
+  };
+};
+const loadAlarms = async () => {
+  try {
+    const projectId =
+      selectedProject !== 'all' && /^\d+$/.test(selectedProject)
+        ? Number(selectedProject)
+        : undefined;
+
+    const data = await alarmApi.getAlarms(projectId);
+    const mapped = data
+      .map(mapAlarmFromApi)
+      .sort((a, b) => new Date(b.time).getTime() - new Date(a.time).getTime());
+
+    setAlarms(mapped);
+  } catch (error) {
+    console.error('加载告警记录失败:', error);
+    setAlarms([]);
   }
-}, []);
+};
+
+useEffect(() => {
+  loadAlarms();
+}, [selectedProject]);
 
 // 监听新告警事件
 useEffect(() => {
-  const handleAlarmAdded = (event: CustomEvent) => {
-    setAlarms(prev => [event.detail, ...prev]);
+  const handleAlarmAdded = async () => {
+    await loadAlarms();
   };
-  
+
   window.addEventListener('alarmAdded', handleAlarmAdded as EventListener);
   return () => window.removeEventListener('alarmAdded', handleAlarmAdded as EventListener);
-}, []);
+}, [selectedProject]);
 
   // useEffect(() => {
   //   // 合并围栏和视频告警数据
@@ -255,32 +300,24 @@ const handleOpenProcessModal = (alarm: AlarmRecord, action: 'resolved' | 'ignore
   setShowProcessModal(true);
 };
 
-const handleConfirmProcess = () => {
+const handleConfirmProcess = async () => {
   if (!processingAlarm) return;
-  
-  // 更新报警状态
-  setAlarms(prev => {
-    const newAlarms = prev.map(alarm =>
-      alarm.id === processingAlarm.id 
-        ? { ...alarm, status: processAction === 'resolved' ? 'resolved' : 'ignored' } 
-        : alarm
-    );
-    // 同步保存到 localStorage
-    localStorage.setItem('alarm_records', JSON.stringify(newAlarms));
-    return newAlarms;
-  });
-  
-  console.log('处理告警:', {
-    alarmId: processingAlarm.id,
-    action: processAction === 'resolved' ? '已处理' : '已忽略',
-    remark: processRemark,
-    operator: '管理员',
-    time: new Date().toISOString()
-  });
-  
-  setShowProcessModal(false);
-  setProcessingAlarm(null);
-  setSelectedAlarm(null);
+
+  try {
+    if (processAction === 'resolved') {
+      await alarmApi.resolveAlarm(Number(processingAlarm.id));
+    } else {
+      await alarmApi.updateAlarm(Number(processingAlarm.id), { status: 'ignored' });
+    }
+
+    await loadAlarms();
+
+    setShowProcessModal(false);
+    setProcessingAlarm(null);
+    setSelectedAlarm(null);
+  } catch (error) {
+    console.error('处理告警失败:', error);
+  }
 };
 
   const filteredAlarms = alarms.filter(alarm => {
@@ -289,20 +326,7 @@ const handleConfirmProcess = () => {
     // 状态筛选
     if (filterStatus !== 'all' && alarm.status !== filterStatus) return false;
       // 分公司筛选
-  if (selectedCompany !== 'all') {
-    // 根据告警内容判断分公司（实际应从数据中获取）
-    if (alarm.deviceName.includes('张工') || alarm.deviceName.includes('李工')) {
-      if (selectedCompany !== '中铁一局') return false;
-    } else if (alarm.deviceName.includes('王工')) {
-      if (selectedCompany !== '中铁隧道局') return false;
-    }
-  }
-  // 项目筛选
-  if (selectedProject !== 'all') {
-    // 根据告警内容判断项目
-    if (alarm.location.includes('8号线') && selectedProject !== '西安地铁8号线') return false;
-    if (alarm.location.includes('10号线') && selectedProject !== '西安地铁10号线') return false;
-  }
+
     // 关键词搜索
     if (searchKeyword && 
     !alarm.title.includes(searchKeyword) && 

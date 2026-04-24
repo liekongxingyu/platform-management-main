@@ -8,9 +8,7 @@ import requests
 import numpy as np
 from datetime import datetime, timedelta
 from app.services.ai_service import AIService
-from app.models.alarm_records import AlarmRecord
-from app.models.video import VideoDevice
-from app.core.database import SessionLocal
+from app.core.database import SessionLocal, get_mongo_db, get_next_sequence
 from app.services import ai_features
 from app.services.video_service import VideoService, RECORD_SEGMENT_SECONDS, RECORD_SEGMENT_SAFE_MARGIN_SECONDS
 from urllib.parse import urlsplit, urlunsplit, unquote, quote
@@ -42,6 +40,39 @@ class AIManager:
         # 算法分发表
         self.algo_handlers = ai_features.get_algo_handlers(self.ai_service)
         print(f"✅ 已加载AI规则: {list(self.algo_handlers.keys())}")
+
+    def _alarm_collection(self):
+        return get_mongo_db()["alarm_record"]
+
+    def _find_alarm_doc_by_id(self, alarm_id: int | str):
+        return self._alarm_collection().find_one({"id": int(alarm_id)})
+
+    def _update_alarm_fields(self, alarm_id: int | str, updates: dict):
+        clean_updates = {k: v for k, v in (updates or {}).items() if k != "_id"}
+        if not clean_updates:
+            return
+        self._alarm_collection().update_one(
+            {"id": int(alarm_id)},
+            {"$set": clean_updates}
+        )
+
+    def _infer_project_id_from_device(self, device_id: int | str):
+        try:
+            db_video = self.video_service._get_video_runtime_by_id(device_id)
+            if not db_video:
+                return None
+
+            # 先尝试直接拿 project_id
+            direct_project_id = getattr(db_video, "project_id", None)
+            if direct_project_id not in [None, "", 0, "0"]:
+                try:
+                    return int(direct_project_id)
+                except Exception:
+                    return direct_project_id
+
+            return None
+        except Exception:
+            return None
 
     def _new_alarm_trace_id(self) -> str:
         return f"alarmtrace-{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}"
@@ -121,7 +152,7 @@ class AIManager:
             try:
                 db_video = None
                 if device_id.isdigit():
-                    db_video = db.query(VideoDevice).filter(VideoDevice.id == int(device_id)).first()
+                    db_video = self.video_service._get_video_runtime_by_id(device_id)
 
                 if db_video and getattr(db_video, "device_serial", None):
                     ezviz_serial = str(getattr(db_video, "device_serial", "") or "").strip()
@@ -752,22 +783,20 @@ class AIManager:
         threading.Thread(target=_worker, daemon=True).start()
 
     def _update_alarm_recording_status(self, alarm_id: int, status: str, path: str | None, error: str | None):
-        db = SessionLocal()
         try:
-            record = db.query(AlarmRecord).filter(AlarmRecord.id == alarm_id).first()
+            record = self._find_alarm_doc_by_id(alarm_id)
             if not record:
                 return
-            record.recording_status = status
-            if path:
-                record.recording_path = path
-            if error:
-                record.recording_error = error[:255]
-            db.commit()
+
+            updates = {
+                "recording_status": status,
+                "recording_path": path or "",
+                "recording_error": (error[:255] if error else ""),
+            }
+
+            self._update_alarm_fields(alarm_id, updates)
         except Exception as e:
             print(f"⚠️ 更新报警录像状态失败 alarm_id={alarm_id}: {e}")
-            db.rollback()
-        finally:
-            db.close()
 
     # =========================
     # 写数据库
@@ -797,44 +826,51 @@ class AIManager:
         if box_count > 0:
             alarm_msg = f"{alarm_msg}（检测框数量: {box_count}）"
 
-        db = SessionLocal()
-
         try:
-            record = AlarmRecord(
-                device_id=str(device_id),
-                alarm_type=alarm_type,
-                severity="HIGH",
-                description=alarm_msg,
-                status="pending",
-                timestamp=datetime.now(),
-                alarm_image_path=image_path,
-                recording_status="pending",
-            )
+            next_id = int(get_next_sequence("alarm_record_id"))
+            now = datetime.now()
 
-            db.add(record)
-            db.commit()
-            db.refresh(record)
+            project_id = self._infer_project_id_from_device(device_id)
+            payload = {
+                "id": next_id,
+                "device_id": str(device_id),
+                "fence_id": None,
+                "project_id": project_id,
+                "alarm_type": alarm_type,
+                "severity": "HIGH",
+                "timestamp": now,
+                "description": alarm_msg,
+                "status": "pending",
+                "handled_at": None,
+                "location": None,
+                "recording_path": "",
+                "recording_status": "pending",
+                "recording_error": "",
+                "alarm_image_path": image_path or "",
+            }
+
+            self._alarm_collection().insert_one(payload)
 
             print(f"[alarm] save db: device_id={device_id}, image_path={image_path}, alarm_type={alarm_type}, alarm_msg={alarm_msg}")
             self._emit_alarm_log(
                 "info",
                 "[ALARM_DB_SAVED] trace_id={} alarm_id={} device_id={} alarm_type={} image_path={} status=pending",
                 alarm_trace_id or "-",
-                record.id,
+                next_id,
                 device_id,
                 alarm_type,
                 image_path or "",
             )
 
             self._save_alarm_clip_async(
-                record.id,
+                next_id,
                 str(device_id),
-                record.timestamp or datetime.now(),
+                now,
                 alarm_trace_id=alarm_trace_id,
             )
 
-            print(f"✅ 报警已保存 (ID: {record.id})")
-            return record.id
+            print(f"✅ 报警已保存 (ID: {next_id})")
+            return next_id
 
         except Exception as e:
             print(f"❌ 数据库写入失败: {e}")
@@ -846,10 +882,7 @@ class AIManager:
                 alarm_type,
                 e,
             )
-            db.rollback()
             return None
-        finally:
-            db.close()
 
 
 ai_manager = AIManager()

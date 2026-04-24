@@ -1,9 +1,8 @@
 import json
 from sqlalchemy.orm import Session
 from urllib.parse import urlparse
-from app.models.video import VideoDevice
-from app.models.device import Device
-from app.models.alarm_records import AlarmRecord
+from typing import Optional, List, Dict, Any, Set, Tuple
+from types import SimpleNamespace
 from app.schemas.video_schema import VideoCreate, VideoUpdate, CameraCreateRequest
 from app.utils.logger import get_logger
 import requests
@@ -20,7 +19,8 @@ import hashlib
 import base64
 import uuid
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Set, Tuple
+
+VideoDevice = Any
 
 RECORDING_PROCESSES = {}
 
@@ -35,7 +35,7 @@ def suppress_verbose_logging():
 
 suppress_verbose_logging()
 
-from app.core.database import SessionLocal
+from app.core.database import SessionLocal, get_video_device_collection, get_next_sequence, get_mongo_db
 
 try:
     import onvif
@@ -105,6 +105,161 @@ CRUISE_TASKS: Dict[int, dict] = {}
 CRUISE_TASKS_LOCK = threading.Lock()
 
 class VideoService:
+    def _video_collection(self):
+        return get_video_device_collection()
+
+    def _get_video_doc_by_id(self, video_id: int | str) -> Optional[dict]:
+        collection = self._video_collection()
+        return collection.find_one({"id": str(video_id)})
+    
+    def _alarm_collection(self):
+        return get_mongo_db()["alarm_record"]
+
+    def _find_pending_alarm_doc(self, device_id: int | str, alarm_type: str):
+        return self._alarm_collection().find_one({
+            "device_id": str(device_id),
+            "alarm_type": alarm_type,
+            "status": "pending",
+        })
+
+    def _create_monitoring_alarm_doc(
+        self,
+        device_id: int | str,
+        alarm_type: str,
+        severity: str,
+        description: str,
+        location: str | None,
+    ):
+        next_id = int(get_next_sequence("alarm_record_id"))
+        payload = {
+            "id": next_id,
+            "device_id": str(device_id),
+            "fence_id": None,
+            "project_id": None,
+            "alarm_type": alarm_type,
+            "severity": severity,
+            "timestamp": datetime.utcnow(),
+            "description": description,
+            "status": "pending",
+            "handled_at": None,
+            "location": location,
+            "recording_path": "",
+            "recording_status": "pending",
+            "recording_error": "",
+            "alarm_image_path": "",
+        }
+        self._alarm_collection().insert_one(payload)
+        return payload
+
+    def _resolve_monitoring_alarm_doc(self, alarm_id: int | str):
+        self._alarm_collection().update_one(
+            {"id": int(alarm_id)},
+            {
+                "$set": {
+                    "status": "resolved",
+                    "handled_at": datetime.utcnow(),
+                }
+            }
+        )
+
+    def _get_video_runtime_by_id(self, video_id: int | str):
+        doc = self._get_video_doc_by_id(video_id)
+        if not doc:
+            return None
+
+        runtime_doc = dict(doc)
+        runtime_doc.pop("_id", None)
+
+        # 统一补默认值，尽量模拟原来 SQLAlchemy 对象上的属性访问体验
+        runtime_doc["id"] = int(runtime_doc["id"]) if str(runtime_doc.get("id", "")).isdigit() else runtime_doc.get("id")
+        runtime_doc["port"] = runtime_doc.get("port", 80)
+        runtime_doc["channel_no"] = runtime_doc.get("channel_no", 1)
+        runtime_doc["supports_ptz"] = runtime_doc.get("supports_ptz", 1)
+        runtime_doc["supports_preset"] = runtime_doc.get("supports_preset", 1)
+        runtime_doc["supports_cruise"] = runtime_doc.get("supports_cruise", 1)
+        runtime_doc["supports_zoom"] = runtime_doc.get("supports_zoom", 1)
+        runtime_doc["supports_focus"] = runtime_doc.get("supports_focus", 0)
+        runtime_doc["status"] = runtime_doc.get("status") or "offline"
+        runtime_doc["is_active"] = runtime_doc.get("is_active", 1)
+        runtime_doc["sleeping"] = runtime_doc.get("sleeping", False)
+        runtime_doc["privacy_enabled"] = runtime_doc.get("privacy_enabled", False)
+        runtime_doc["storage_abnormal"] = runtime_doc.get("storage_abnormal", False)
+        runtime_doc["low_battery"] = runtime_doc.get("low_battery", False)
+        runtime_doc["weak_signal"] = runtime_doc.get("weak_signal", False)
+        runtime_doc["weekly_quota_bytes"] = runtime_doc.get("weekly_quota_bytes", DEFAULT_WEEKLY_QUOTA_BYTES)
+
+        from types import SimpleNamespace
+        return SimpleNamespace(**runtime_doc)
+
+    def _update_video_fields(self, video_id: int | str, updates: dict):
+        clean_updates = {k: v for k, v in (updates or {}).items() if k != "_id"}
+        if not clean_updates:
+            return
+        clean_updates["updatedAt"] = datetime.utcnow()
+        self._video_collection().update_one(
+            {"id": str(video_id)},
+            {"$set": clean_updates}
+        )
+
+    def _prepare_video_payload(self, payload: dict) -> dict:
+        payload = dict(payload or {})
+
+        payload["stream_protocol"] = self._normalize_stream_protocol(payload.get("stream_protocol"))
+        payload["platform_type"] = payload.get("platform_type") or "onvif"
+        payload["access_source"] = payload.get("access_source") or "local"
+        payload["ptz_source"] = payload.get("ptz_source") or "onvif"
+        payload["channel_no"] = payload.get("channel_no") or 1
+        payload["supports_ptz"] = payload.get("supports_ptz", 1)
+        payload["supports_preset"] = payload.get("supports_preset", 1)
+        payload["supports_cruise"] = payload.get("supports_cruise", 1)
+        payload["supports_zoom"] = payload.get("supports_zoom", 1)
+        payload["supports_focus"] = payload.get("supports_focus", 0)
+        payload["status"] = payload.get("status") or "offline"
+        payload["is_active"] = payload.get("is_active", 1)
+        payload["company"] = payload.get("company")
+        payload["project"] = payload.get("project")
+        payload["sleeping"] = payload.get("sleeping", False)
+        payload["privacy_enabled"] = payload.get("privacy_enabled", False)
+        payload["storage_abnormal"] = payload.get("storage_abnormal", False)
+        payload["low_battery"] = payload.get("low_battery", False)
+        payload["weak_signal"] = payload.get("weak_signal", False)
+        payload["weekly_quota_bytes"] = payload.get("weekly_quota_bytes", DEFAULT_WEEKLY_QUOTA_BYTES)
+
+        return payload
+
+    def _mongo_video_to_out(self, doc: dict) -> dict:
+        if not doc:
+            return {}
+
+        return {
+            "id": str(doc.get("id", "")),
+            "name": doc.get("name"),
+            "ip_address": doc.get("ip_address"),
+            "port": doc.get("port", 80),
+            "username": doc.get("username"),
+            "password": doc.get("password"),
+            "stream_url": doc.get("stream_url"),
+            "rtsp_url": doc.get("rtsp_url"),
+            "stream_protocol": doc.get("stream_protocol"),
+            "platform_type": doc.get("platform_type"),
+            "access_source": doc.get("access_source"),
+            "ptz_source": doc.get("ptz_source"),
+            "device_serial": doc.get("device_serial"),
+            "channel_no": doc.get("channel_no", 1),
+            "supports_ptz": doc.get("supports_ptz", 1),
+            "supports_preset": doc.get("supports_preset", 1),
+            "supports_cruise": doc.get("supports_cruise", 1),
+            "supports_zoom": doc.get("supports_zoom", 1),
+            "supports_focus": doc.get("supports_focus", 0),
+            "latitude": doc.get("latitude"),
+            "longitude": doc.get("longitude"),
+            "status": doc.get("status"),
+            "remark": doc.get("remark"),
+            "is_active": doc.get("is_active", 1),
+            "company": doc.get("company"),
+            "project": doc.get("project"),
+        }
+    
     def _normalize_flag(self, value: Any) -> bool:
         if isinstance(value, bool):
             return value
@@ -239,12 +394,10 @@ class VideoService:
         weak_signal = self._normalize_flag(getattr(db_video, "weak_signal", False))
 
         alarm_active = bool(
-            db.query(AlarmRecord)
-            .filter(
-                AlarmRecord.device_id == str(db_video.id),
-                AlarmRecord.status == "pending",
-            )
-            .first()
+            self._alarm_collection().find_one({
+                "device_id": str(db_video.id),
+                "status": "pending",
+            })
         )
 
         status_tags: list[str] = []
@@ -291,7 +444,7 @@ class VideoService:
     def _sync_single_monitoring_alarm(
         self,
         db: Session,
-        db_video: VideoDevice,
+        db_video,
         alarm_type: str,
         severity: str,
         description: str,
@@ -299,34 +452,23 @@ class VideoService:
     ) -> bool:
         """将监控状态同步为报警记录：active=True 生成待处理报警，False 自动恢复。"""
         device_id = str(db_video.id)
-        pending_alarm = (
-            db.query(AlarmRecord)
-            .filter(
-                AlarmRecord.device_id == device_id,
-                AlarmRecord.alarm_type == alarm_type,
-                AlarmRecord.status == "pending",
-            )
-            .first()
-        )
+        pending_alarm = self._find_pending_alarm_doc(device_id, alarm_type)
 
         if active:
             if pending_alarm:
                 return False
-            db.add(
-                AlarmRecord(
-                    device_id=device_id,
-                    alarm_type=alarm_type,
-                    severity=severity,
-                    description=description,
-                    location=db_video.name or f"视频设备-{device_id}",
-                    status="pending",
-                )
+
+            self._create_monitoring_alarm_doc(
+                device_id=device_id,
+                alarm_type=alarm_type,
+                severity=severity,
+                description=description,
+                location=db_video.name or f"视频设备-{device_id}",
             )
             return True
 
         if pending_alarm:
-            pending_alarm.status = "resolved"
-            pending_alarm.handled_at = datetime.utcnow() + timedelta(hours=8)
+            self._resolve_monitoring_alarm_doc(pending_alarm["id"])
             return True
 
         return False
@@ -413,7 +555,7 @@ class VideoService:
         return changed
 
     def get_monitoring_summary(self, db: Session, video_id: int):
-        db_video = db.query(VideoDevice).filter(VideoDevice.id == video_id).first()
+        db_video = self._get_video_runtime_by_id(video_id)
         if not db_video:
             return None
 
@@ -443,13 +585,6 @@ class VideoService:
             weekly_remaining_bytes=weekly_remaining_bytes,
         )
         status_summary = self._build_device_status_summary(db, db_video)
-
-        if has_alarm_changes:
-            try:
-                db.commit()
-            except Exception as e:
-                db.rollback()
-                logger.error(f"Failed to persist monitoring alarms: {e}")
 
         return {
             "device_id": db_video.id,
@@ -625,7 +760,7 @@ class VideoService:
             return {"status": "error", "message": f"摄像头校时失败: {e}"}
 
     def sync_camera_time_if_needed(self, db: Session, video_id: int, force: bool = False) -> dict:
-        db_video = db.query(VideoDevice).filter(VideoDevice.id == video_id).first()
+        db_video = self._get_video_runtime_by_id(video_id)
         if not db_video:
             return {"status": "error", "message": "设备不存在"}
         return self._sync_camera_time_for_video(db_video, force=force)
@@ -727,8 +862,9 @@ class VideoService:
         return False
 
     def ptz_stop_move(self, db: Session, video_id: int):
-        db_video = db.query(VideoDevice).filter(VideoDevice.id == video_id).first()
-        if not db_video: raise ValueError("Device not found")
+        db_video = self._get_video_runtime_by_id(video_id)
+        if not db_video:
+            raise ValueError("Device not found")
 
         if self._is_ezviz_ptz(db_video):
             return self._ezviz_ptz_stop(db_video)
@@ -765,8 +901,9 @@ class VideoService:
             raise ValueError(f"停止失败: {e}")
 
     def ptz_start_move(self, db: Session, video_id: int, direction: str, speed: float = 0.5):
-        db_video = db.query(VideoDevice).filter(VideoDevice.id == video_id).first()
-        if not db_video: raise ValueError("Device not found")
+        db_video = self._get_video_runtime_by_id(video_id)
+        if not db_video:
+            raise ValueError("Device not found")
 
         if self._is_ezviz_ptz(db_video):
             return self._ezviz_ptz_start(db_video, direction, speed)
@@ -801,7 +938,7 @@ class VideoService:
         dwell_seconds: float,
         rounds: Optional[int],
     ):
-        db_video = db.query(VideoDevice).filter(VideoDevice.id == video_id).first()
+        db_video = self._get_video_runtime_by_id(video_id)
         if not db_video:
             raise ValueError("Device not found")
 
@@ -815,12 +952,11 @@ class VideoService:
             if missing:
                 raise ValueError(f"以下预置点不存在: {', '.join(missing)}")
 
-        db_video.cruise_preset_tokens_json = json.dumps([str(x) for x in preset_tokens], ensure_ascii=False)
-        db_video.cruise_dwell_seconds = float(dwell_seconds or 8.0)
-        db_video.cruise_rounds = rounds
-
-        db.commit()
-        db.refresh(db_video)
+        self._update_video_fields(video_id, {
+            "cruise_preset_tokens_json": json.dumps([str(x) for x in preset_tokens], ensure_ascii=False),
+            "cruise_dwell_seconds": float(dwell_seconds or 8.0),
+            "cruise_rounds": rounds,
+        })
 
         return {
             "status": "success",
@@ -831,7 +967,7 @@ class VideoService:
         }
 
     def get_current_cruise_config(self, db: Session, video_id: int):
-        db_video = db.query(VideoDevice).filter(VideoDevice.id == video_id).first()
+        db_video = self._get_video_runtime_by_id(video_id)
         if not db_video:
             raise ValueError("Device not found")
 
@@ -1344,7 +1480,7 @@ class VideoService:
             raise ValueError(f"PTZ_STOP_FAILED: {first_error}")
 
     def get_stream_info(self, db: Session, video_id: int):
-        db_video = db.query(VideoDevice).filter(VideoDevice.id == video_id).first()
+        db_video = self._get_video_runtime_by_id(video_id)
         if not db_video:
             return None
 
@@ -1353,7 +1489,7 @@ class VideoService:
         return self._get_stream_info_local(db_video)
 
     def _create_ptz_and_media(self, db: Session, video_id: int):
-        db_video = db.query(VideoDevice).filter(VideoDevice.id == video_id).first()
+        db_video = self._get_video_runtime_by_id(video_id)
         if not db_video:
             raise ValueError("Device not found")
         camera, ptz, media = self._get_onvif_service(db_video)
@@ -1361,7 +1497,7 @@ class VideoService:
         return db_video, camera, ptz, media, token
 
     def list_presets(self, db: Session, video_id: int):
-        db_video = db.query(VideoDevice).filter(VideoDevice.id == video_id).first()
+        db_video = self._get_video_runtime_by_id(video_id)
         if not db_video:
             raise ValueError("Device not found")
 
@@ -1442,7 +1578,7 @@ class VideoService:
         return result
 
     def set_preset(self, db: Session, video_id: int, name: Optional[str] = None, preset_token: Optional[str] = None):
-        db_video = db.query(VideoDevice).filter(VideoDevice.id == video_id).first()
+        db_video = self._get_video_runtime_by_id(video_id)
         if not db_video:
             raise ValueError("Device not found")
 
@@ -1550,7 +1686,7 @@ class VideoService:
     #         raise ValueError(f"创建预置点失败: {e}")
 
     def goto_preset(self, db: Session, video_id: int, preset_token: str, speed: float = 0.5):
-        db_video = db.query(VideoDevice).filter(VideoDevice.id == video_id).first()
+        db_video = self._get_video_runtime_by_id(video_id)
         if not db_video:
             raise ValueError("Device not found")
 
@@ -1565,11 +1701,11 @@ class VideoService:
 
         _, _, ptz, _, token = self._create_ptz_and_media(db, video_id)
         req = {
-            'ProfileToken': token,
-            'PresetToken': preset_token,
-            'Speed': {
-                'PanTilt': {'x': speed, 'y': speed},
-                'Zoom': {'x': speed}
+            "ProfileToken": token,
+            "PresetToken": preset_token,
+            "Speed": {
+                "PanTilt": {"x": speed, "y": speed},
+                "Zoom": {"x": speed}
             }
         }
         try:
@@ -1579,7 +1715,7 @@ class VideoService:
             raise ValueError(f"调用预置点失败: {e}")
 
     def remove_preset(self, db: Session, video_id: int, preset_token: str):
-        db_video = db.query(VideoDevice).filter(VideoDevice.id == video_id).first()
+        db_video = self._get_video_runtime_by_id(video_id)
         if not db_video:
             raise ValueError("Device not found")
 
@@ -1606,7 +1742,7 @@ class VideoService:
         if not preset_tokens:
             raise ValueError("preset_tokens 不能为空")
 
-        db_video = db.query(VideoDevice).filter(VideoDevice.id == video_id).first()
+        db_video = self._get_video_runtime_by_id(video_id)
         if not db_video:
             raise ValueError("Device not found")
 
@@ -1709,7 +1845,7 @@ class VideoService:
         if len(preset_tokens) < 2:
             raise ValueError("巡航至少需要两个预置点")
 
-        db_video = db.query(VideoDevice).filter(VideoDevice.id == video_id).first()
+        db_video = self._get_video_runtime_by_id(video_id)
         if not db_video:
             raise ValueError("Device not found")
 
@@ -1808,54 +1944,73 @@ class VideoService:
     # -------------------------------------------------------------------------
     def add_camera_to_media_server(self, db: Session, camera_data: CameraCreateRequest):
         logger.info(f"Adding stream: {camera_data.name}")
+
+        collection = self._video_collection()
         ip_address = camera_data.ip_address or self._extract_ip_from_rtsp(camera_data.rtsp_url) or ""
         port = camera_data.port or 80
 
-        # 先落库拿到稳定ID，再用 ID 作为 stream_name，避免名称改动导致流路径漂移。
-        new_video = VideoDevice(
-            name=camera_data.name,
-            ip_address=ip_address,
-            port=port,
-            username=camera_data.username,
-            password=camera_data.password,
-            stream_url="",
-            rtsp_url=camera_data.rtsp_url,
-            stream_protocol=self._normalize_stream_protocol(camera_data.stream_protocol),
-            platform_type=(camera_data.platform_type or "onvif"),
-            access_source=(camera_data.access_source or "local"),
-            ptz_source=(camera_data.ptz_source or "onvif"),
-            device_serial=camera_data.device_serial,
-            channel_no=camera_data.channel_no or 1,
-            supports_ptz=1,
-            supports_preset=1,
-            supports_cruise=1,
-            supports_zoom=1,
-            supports_focus=0,
-            latitude=camera_data.latitude,
-            longitude=camera_data.longitude,
-            status="online",
-            remark=camera_data.remark,
-        )
-        db.add(new_video)
-        db.commit()
-        db.refresh(new_video)
+        next_id = str(get_next_sequence("video_device_id"))
 
-        # 新增或替换设备后先尝试同步摄像头时间，避免 OSD 时间持续漂移。
+        payload = {
+            "id": next_id,
+            "name": camera_data.name,
+            "ip_address": ip_address,
+            "port": port,
+            "username": camera_data.username,
+            "password": camera_data.password,
+            "stream_url": "",
+            "rtsp_url": camera_data.rtsp_url,
+            "stream_protocol": self._normalize_stream_protocol(camera_data.stream_protocol),
+            "platform_type": (camera_data.platform_type or "onvif"),
+            "access_source": (camera_data.access_source or "local"),
+            "ptz_source": (camera_data.ptz_source or "onvif"),
+            "device_serial": camera_data.device_serial,
+            "channel_no": camera_data.channel_no or 1,
+            "supports_ptz": 1,
+            "supports_preset": 1,
+            "supports_cruise": 1,
+            "supports_zoom": 1,
+            "supports_focus": 0,
+            "latitude": camera_data.latitude,
+            "longitude": camera_data.longitude,
+            "status": "online",
+            "remark": camera_data.remark,
+            "is_active": 1,
+            "createdAt": datetime.utcnow(),
+            "updatedAt": datetime.utcnow(),
+            "sleeping": False,
+            "privacy_enabled": False,
+            "storage_abnormal": False,
+            "low_battery": False,
+            "weak_signal": False,
+            "weekly_quota_bytes": DEFAULT_WEEKLY_QUOTA_BYTES,
+        }
+
+        collection.insert_one(payload)
+
+        new_video = self._get_video_runtime_by_id(next_id)
+        if not new_video:
+            raise ValueError("设备写入 Mongo 成功，但读取失败")
+
+        # 新增设备后先尝试同步摄像头时间，避免 OSD 时间持续漂移
         sync_result = self._sync_camera_time_for_video(new_video, force=True)
         if sync_result.get("status") == "error":
-            logger.warning(f"Initial camera time sync failed for video_id={new_video.id}: {sync_result.get('message')}")
+            logger.warning(
+                f"Initial camera time sync failed for video_id={new_video.id}: {sync_result.get('message')}"
+            )
 
         stream_name = str(new_video.id)
 
         # 启动推流并更新播放地址
         self.start_ffmpeg_stream(camera_data.rtsp_url, stream_name)
         flv_url = f"{NMS_HOST}/live/{stream_name}.flv"
-        new_video.stream_url = flv_url
-        db.commit()
-        db.refresh(new_video)
 
+        self._update_video_fields(next_id, {"stream_url": flv_url})
+
+        updated_video = self._get_video_doc_by_id(next_id)
         self.start_ffmpeg_recording(new_video.id, camera_data.rtsp_url)
-        return new_video
+
+        return self._mongo_video_to_out(updated_video)
 
     def sync_hikvision_devices(self, db: Session):
         # 当前项目以 RTSP/ONVIF 手动接入为主，保留同步接口避免路由调用时报错。
@@ -1863,58 +2018,103 @@ class VideoService:
         return []
 
     def create_video(self, db: Session, video_data: VideoCreate):
-        payload = video_data.model_dump()
-        payload["stream_protocol"] = self._normalize_stream_protocol(payload.get("stream_protocol"))
-        payload["platform_type"] = payload.get("platform_type") or "onvif"
-        payload["access_source"] = payload.get("access_source") or "local"
-        payload["ptz_source"] = payload.get("ptz_source") or "onvif"
-        payload["channel_no"] = payload.get("channel_no") or 1
-        new_video = VideoDevice(**payload)
-        db.add(new_video)
-        db.commit()
-        db.refresh(new_video)
-        return new_video
+        collection = self._video_collection()
+
+        payload = self._prepare_video_payload(video_data.model_dump())
+        next_id = str(get_next_sequence("video_device_id"))
+        payload["id"] = next_id
+        payload["createdAt"] = datetime.utcnow()
+        payload["updatedAt"] = datetime.utcnow()
+
+        collection.insert_one(payload)
+        created = collection.find_one({"id": next_id})
+        return self._mongo_video_to_out(created)
 
     def get_videos(self, db: Session, skip: int = 0, limit: int = 100):
-        return db.query(VideoDevice).offset(skip).limit(limit).all()
+        collection = self._video_collection()
+        docs = list(collection.find({}, {"_id": 0}))
+        docs.sort(key=lambda x: int(str(x.get("id", "0"))))
+        docs = docs[max(0, int(skip)): max(0, int(skip)) + max(1, int(limit))]
+        return [self._mongo_video_to_out(doc) for doc in docs]
 
     def update_video(self, db: Session, video_id: int, video_data: VideoUpdate):
-        db_video = db.query(VideoDevice).filter(VideoDevice.id == video_id).first()
-        if not db_video: return None
+        collection = self._video_collection()
+        video_id = str(video_id)
+
+        existing = collection.find_one({"id": video_id})
+        if not existing:
+            return None
+
         update_payload = video_data.model_dump(exclude_unset=True)
+
         if "stream_protocol" in update_payload:
             update_payload["stream_protocol"] = self._normalize_stream_protocol(update_payload.get("stream_protocol"))
 
-        for key, value in update_payload.items():
-            setattr(db_video, key, value)
+        if "platform_type" in update_payload and not update_payload.get("platform_type"):
+            update_payload["platform_type"] = "onvif"
+        if "access_source" in update_payload and not update_payload.get("access_source"):
+            update_payload["access_source"] = "local"
+        if "ptz_source" in update_payload and not update_payload.get("ptz_source"):
+            update_payload["ptz_source"] = "onvif"
+        if "channel_no" in update_payload and not update_payload.get("channel_no"):
+            update_payload["channel_no"] = 1
 
-        if db_video.rtsp_url and (not db_video.stream_url or "/live/" not in str(db_video.stream_url)):
-            db_video.stream_url = f"{NMS_HOST}/live/{video_id}.flv"
+        merged = {**existing, **update_payload}
 
-        db.commit()
-        db.refresh(db_video)
-        if video_id in ONVIF_CLIENT_CACHE: del ONVIF_CLIENT_CACHE[video_id]
-        if video_id in CAMERA_TIME_SYNC_CACHE: del CAMERA_TIME_SYNC_CACHE[video_id]
-        return db_video
+        if merged.get("rtsp_url") and (not merged.get("stream_url") or "/live/" not in str(merged.get("stream_url"))):
+            merged["stream_url"] = f"{NMS_HOST}/live/{video_id}.flv"
+
+        merged["updatedAt"] = datetime.utcnow()
+
+        collection.update_one(
+            {"id": video_id},
+            {"$set": {k: v for k, v in merged.items() if k != "_id"}}
+        )
+
+        updated = collection.find_one({"id": video_id})
+
+        for key in (video_id, str(video_id), int(video_id) if str(video_id).isdigit() else None):
+            if key is None:
+                continue
+            if key in ONVIF_CLIENT_CACHE:
+                del ONVIF_CLIENT_CACHE[key]
+            if key in EZVIZ_PTZ_LAST_DIRECTION:
+                del EZVIZ_PTZ_LAST_DIRECTION[key]
+            if key in EZVIZ_PTZ_LAST_STOP_AT:
+                del EZVIZ_PTZ_LAST_STOP_AT[key]
+            if key in CAMERA_TIME_SYNC_CACHE:
+                del CAMERA_TIME_SYNC_CACHE[key]
+
+        return self._mongo_video_to_out(updated)
 
     def delete_video(self, db: Session, video_id: int):
-        db_video = db.query(VideoDevice).filter(VideoDevice.id == video_id).first()
-        if db_video:
-            stream_name = str(db_video.id)
-            self.stop_ffmpeg_stream(stream_name)
-            self.stop_ffmpeg_recording(video_id)
-            self.stop_cruise(video_id)
+        collection = self._video_collection()
+        video_id = str(video_id)
 
-            db.delete(db_video)
-            db.commit()
-            if video_id in ONVIF_CLIENT_CACHE:
-                del ONVIF_CLIENT_CACHE[video_id]
-            if video_id in EZVIZ_PTZ_LAST_DIRECTION:
-                del EZVIZ_PTZ_LAST_DIRECTION[video_id]
-            if video_id in EZVIZ_PTZ_LAST_STOP_AT:
-                del EZVIZ_PTZ_LAST_STOP_AT[video_id]
-            return True
-        return False
+        db_video = collection.find_one({"id": video_id})
+        if not db_video:
+            return False
+
+        stream_name = str(db_video.get("id"))
+        self.stop_ffmpeg_stream(stream_name)
+        self.stop_ffmpeg_recording(video_id)
+        self.stop_cruise(video_id)
+
+        collection.delete_one({"id": video_id})
+
+        for key in (video_id, str(video_id), int(video_id) if str(video_id).isdigit() else None):
+            if key is None:
+                continue
+            if key in ONVIF_CLIENT_CACHE:
+                del ONVIF_CLIENT_CACHE[key]
+            if key in EZVIZ_PTZ_LAST_DIRECTION:
+                del EZVIZ_PTZ_LAST_DIRECTION[key]
+            if key in EZVIZ_PTZ_LAST_STOP_AT:
+                del EZVIZ_PTZ_LAST_STOP_AT[key]
+            if key in CAMERA_TIME_SYNC_CACHE:
+                del CAMERA_TIME_SYNC_CACHE[key]
+
+        return True
 
     def get_stream_url(self, db: Session, video_id: int):
         stream_info = self.get_stream_info(db, video_id)
@@ -2298,7 +2498,10 @@ class VideoService:
             return False
 
     def ensure_all_recordings(self, db: Session):
-        videos = db.query(VideoDevice).all()
+        docs = list(self._video_collection().find({}, {"_id": 0}))
+        videos = [self._get_video_runtime_by_id(doc.get("id")) for doc in docs]
+        videos = [v for v in videos if v]
+
         for v in videos:
             entry = RECORDING_PROCESSES.get(v.id)
             if isinstance(entry, dict):
